@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the guard tests (fake LM Studio, fake Claude, no network)
+        run: |
+          git config --global user.email "ci@localhost"
+          git config --global user.name "ci"
+          python3 -m unittest discover -s tests -v

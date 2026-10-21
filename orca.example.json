@@ -1,0 +1,15 @@
+{
+  "base_url": "http://localhost:1234/v1",
+  "model": "qwen/qwen3.6-35b-a3b",
+  "model_key": "qwen/qwen3.6-35b-a3b",
+  "context_tokens": 32768,
+  "prompt_budget_tokens": 28000,
+  "claude_model": "sonnet",
+  "test_cmd": "pytest -q",
+  "setup_cmd": "",
+  "max_attempts": 5,
+  "checkpoint_every": 8,
+  "min_free_pct": 15,
+  "max_swap_mb": 3000,
+  "reload_every": 0
+}

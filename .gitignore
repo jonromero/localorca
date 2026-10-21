@@ -1,0 +1,20 @@
+# LocalOrca keeps your apps in this same folder. They must NEVER be committed,
+# so this file ignores everything and lists the few files that belong to LocalOrca.
+/*
+!/.gitignore
+!/.github/
+!/README.md
+!/CONTRIBUTING.md
+!/house_rules.md
+!/orca.example.json
+!/orca.py
+!/orca_design.py
+!/orca_preview.py
+!/orca_report.py
+!/orca_smoke.py
+!/orca_tui.py
+!/tests/
+!/screenshots/
+
+__pycache__/
+.DS_Store
