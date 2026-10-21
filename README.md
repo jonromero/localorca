@@ -30,7 +30,7 @@ That's it. Claude researches and builds the prototype while the dashboard shows 
 
 `--run` is safe to always add: it opens the running build if there is one, starts the build if there isn't (handy after you add tasks), and in the design stage builds the prototype if there is none yet.
 
-> These notes are Claude-generated, based on my thoughts during development. There are some amazing insights in here that I didn't want to summarize, in case you are interested.
+> Hey, the notes below are Claude-generated, based on my thoughts during development. There are some amazing insights in here that I didn't want to summarize, in case you are interested. I'll extract some gems in the future.
 
 ## Flow
 
