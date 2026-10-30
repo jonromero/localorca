@@ -60,6 +60,8 @@ DEFAULTS = {
     "escalate_after": 3,         # ...or after this many failed attempts, even if the failures differ (close-but-not-quite loops)
     "max_escalations": 2,
     "max_steps": 30,             # tool calls per attempt
+    "compact_at": 0.8,           # when the chat reaches this share of prompt_budget_tokens, Qwen writes notes and a fresh chat replaces it (0 = off)
+    "max_compactions": 2,        # compactions per attempt
     "halt_after_blocked": 2,     # stop the run after N blocked tasks in a row
     "checkpoint_every": 8,       # course check: Claude looks at the RUNNING app and fixes the open task list every N passing tasks (0 = off)
     "checkpoint_minutes": 90,    # ...or after this many minutes since the last check (0 = no time trigger)
@@ -1756,6 +1758,63 @@ def shrink(msgs):
                 tc["function"]["arguments"] = json.dumps(a)
 
 
+COMPACT_ASK = ("Your chat is nearly full, so it is about to be replaced by a fresh one. Write NOTES for your future self. "
+               "Plain bullets, under 250 words, NO tool calls. Cover: 1) what you already wrote or changed (file: what), "
+               "2) facts you learned that you would otherwise read a file again to find (names, signatures, paths, how an "
+               "existing function behaves), 3) what is still left to do for this task, 4) the last test result or error and "
+               "what you think causes it.")
+
+
+def attempt_facts(msgs):
+    """Exact facts from the chat itself, no model: the files written or edited, and the last command with its result."""
+    files, cmd_of, last = [], {}, ""
+    for m in msgs:
+        for tc in m.get("tool_calls") or []:
+            try:
+                a = json.loads(tc["function"]["arguments"] or "{}")
+            except ValueError:
+                continue
+            if tc["function"]["name"] in ("write_file", "replace_in_file") and a.get("path") and a["path"] not in files:
+                files.append(str(a["path"]))
+            if tc["function"]["name"] == "run":
+                cmd_of[tc.get("id")] = str(a.get("cmd") or a.get("command") or "")[:120]
+        if m.get("role") == "tool" and m.get("tool_call_id") in cmd_of:
+            last = "$ %s\n%s" % (cmd_of[m["tool_call_id"]], clip(OMIT_RE.sub("", m.get("content") or ""), 700))
+    out = []
+    if files:
+        out.append("Files you wrote or edited in this attempt: " + ", ".join(files[:20]))
+    if last:
+        out.append("Your last command and its result:\n" + last)
+    return "\n".join(out)
+
+
+def compact_chat(P, task, hint, last_fail, msgs, mode, why):
+    """Replace a big chat by the task prompt plus NOTES that Qwen wrote itself (and exact facts Orca collected). The chat
+    is sent as it is with one more question, so LM Studio's prompt cache is reused. A failed or empty answer still compacts,
+    with the facts alone. Returns the new, small chat."""
+    before = est_tokens(msgs)
+    set_state(phase="Qwen compacting its chat")
+    log("  compacting Qwen's chat (%s), about %d tokens" % (why, before))
+    notes = ""
+    try:
+        resp = lm_chat(P.cfg, msgs + [{"role": "user", "content": COMPACT_ASK}], "off", max_tokens=900)
+        u = resp.get("usage") or {}
+        record("qwen", "compact", prompt=u.get("prompt_tokens"), completion=u.get("completion_tokens"))
+        notes = strip_think(resp["choices"][0]["message"].get("content") or "")
+    except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError) as e:
+        log("  compaction question failed (%s), keeping the facts only" % e)
+    notes = clip(OMIT_RE.sub("", notes).strip(), 2500)
+    body = "\n\n".join(x for x in (notes, attempt_facts(msgs)) if x) or "(nothing was written yet)"
+    user = (build_prompt(P, task, hint, last_fail) +
+            "\n\n# NOTES FROM YOUR EARLIER WORK ON THIS TASK\nYour chat grew too big and was replaced by this fresh one. "
+            "These are your own notes. The files on disk are the truth. Continue from here, do not start over, do not redo "
+            "finished work.\n" + body)
+    new = [msgs[0], {"role": "user", "content": user}]
+    set_state(ctx_tokens=est_tokens(new))
+    log("  compacted: about %d -> %d tokens" % (before, est_tokens(new)))
+    return new
+
+
 def smoke_command(P):
     """The real-app check command, or "" when this project has none."""
     c = P.cfg
@@ -1900,13 +1959,21 @@ def agent_attempt(P, task, hint, last_fail, tag, mode="default"):
             {"role": "user", "content": build_prompt(P, task, hint, last_fail)}]
     summary, nudges = "", 0
     seen, streak = set(), 0          # files read since the last write, calls since the last write
-    set_state(think=mode)
+    compactions = 0
+    set_state(think=mode, compactions=0)
     for step in range(c["max_steps"]):
         # Only shorten history when it is getting big. Rewriting old messages (1) shows the model markers it
         # tends to copy, and (2) breaks LM Studio's prompt cache, so every step re-reads the whole chat.
         budget = live_budget(P)                      # (C) in the dashboard can change it while the build runs
-        if est_tokens(msgs) > budget * 0.6:
-            shrink(msgs)
+        grown = est_tokens(msgs[2:])                 # what this attempt added to the task prompt
+        can_compact = c.get("compact_at", 0) and compactions < c.get("max_compactions", 2)
+        if can_compact and grown > 4000 and est_tokens(msgs) > budget * c["compact_at"]:
+            msgs = compact_chat(P, task, hint, last_fail, msgs, mode, "chat at %d%% of the budget" % (100 * est_tokens(msgs) // budget))
+            compactions += 1
+            set_state(compactions=compactions)
+            seen, streak = set(), 0                  # the old reads are gone from the chat, reading again is fine now
+        elif not can_compact and est_tokens(msgs) > budget * 0.6:
+            shrink(msgs)                             # compaction is off or used up: the old way, squash old tool output
         if est_tokens(msgs) > budget:
             summary = "context budget exhausted"
             log("  context budget hit, ending attempt")

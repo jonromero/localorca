@@ -57,6 +57,12 @@ class FakeLM:
                 if "# CURRENT TASK" not in user:          # the thinking probe
                     return self._send(200, {"choices": [{"message": {"role": "assistant", "content": "OK"}}],
                                             "usage": {"completion_tokens": 1}})
+                if msgs[-1]["role"] == "user" and msgs[-1]["content"].startswith("Your chat is nearly full"):
+                    fake.asked += 1                       # the compaction question: answered with text, not a tool call
+                    if fake.fail_compact:
+                        return self._send(500, {"error": "boom"})
+                    return self._send(200, {"choices": [{"message": {"role": "assistant", "content": fake.notes}}],
+                                            "usage": {"prompt_tokens": 10, "completion_tokens": 20}})
                 tid = user.split("# CURRENT TASK\n", 1)[1].split(":", 1)[0].strip()
                 calls = fake.brain(tid, msgs)
                 tc = [{"id": "c%d_%d" % (len(msgs), i), "type": "function",
@@ -66,6 +72,7 @@ class FakeLM:
 
         self.brain = brain
         self.compact = "- a\n- b\n- c"
+        self.notes, self.asked, self.fail_compact = "- NOTE-FROM-QWEN: hi() lives in hello.py", 0, False
         self.srv = HTTPServer(("127.0.0.1", 0), H)
         self.url = "http://127.0.0.1:%d/v1" % self.srv.server_port
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -983,6 +990,103 @@ class TestCourseCheck(unittest.TestCase):
         finally:
             lm.close()
             p.close()
+
+
+class TestChatCompaction(unittest.TestCase):
+    """LM Studio only drops old messages when the chat is full. Orca asks Qwen for notes and starts a fresh chat with
+    the task plus those notes, so an attempt continues instead of dying at the budget."""
+
+    CFG = {"prompt_budget_tokens": 6000, "context_tokens": 8192}
+
+    def _reader(self):
+        """Reads a 6000 char file until the chat was compacted, then writes feature.py and finishes."""
+        def brain(tid, msgs):
+            if "NOTES FROM YOUR EARLIER WORK" in msgs[1]["content"]:
+                if any(m["role"] == "tool" for m in msgs):
+                    return [("done", {"summary": "ok"})]
+                return [write("feature.py", "x = 2\n")]
+            return [("read_file", {"path": "big.txt"})]
+        return brain
+
+    def _project(self, cfg=None):
+        p = Project(["- [ ] T01: build feature.py | done when: a test shows it"], dict(self.CFG, **(cfg or {})))
+        (p.dir / "big.txt").write_text(("x" * 99 + "\n") * 60)
+        return p
+
+    def test_a_full_chat_is_replaced_by_notes_and_the_attempt_continues(self):
+        lm = FakeLM(self._reader())
+        p = self._project()
+        try:
+            out = p.run(lm)
+            self.assertEqual(p.marks()["T01"], "x")
+            self.assertEqual(lm.asked, 1)
+            self.assertIn("compacted: about", out)
+            self.assertNotIn("context budget hit", out)
+            msgs = json.loads(next((p.dir / "orca" / "logs").glob("T01*.json")).read_text())
+            self.assertEqual(msgs[1]["role"], "user")
+            self.assertIn("# CURRENT TASK", msgs[1]["content"])          # the fresh chat still carries the whole task
+            self.assertIn("NOTE-FROM-QWEN", msgs[1]["content"])          # and Qwen's own notes
+        finally:
+            lm.close()
+            p.close()
+
+    def test_off_means_the_old_behaviour(self):
+        lm = FakeLM(self._reader())
+        p = self._project({"compact_at": 0})
+        try:
+            out = p.run(lm)
+            self.assertEqual(lm.asked, 0)
+            self.assertIn("context budget hit", out)
+            self.assertEqual(p.marks()["T01"], "!")
+        finally:
+            lm.close()
+            p.close()
+
+    def test_a_failed_notes_request_still_compacts_with_the_facts(self):
+        def brain(tid, msgs):
+            if "NOTES FROM YOUR EARLIER WORK" in msgs[1]["content"]:
+                return [("done", {"summary": "ok"})]
+            if not any(m["role"] == "tool" for m in msgs):
+                return [write("a.py", "y = 1\n")]
+            return [("read_file", {"path": "big.txt"})]
+        lm = FakeLM(brain)
+        lm.fail_compact = True
+        p = self._project()
+        try:
+            p.run(lm)
+            self.assertEqual(p.marks()["T01"], "x")
+            msgs = json.loads(next((p.dir / "orca" / "logs").glob("T01*.json")).read_text())
+            self.assertIn("Files you wrote or edited in this attempt: a.py", msgs[1]["content"])
+        finally:
+            lm.close()
+            p.close()
+
+    def test_compaction_never_extends_the_attempt_limit(self):
+        """Sometimes Qwen just cannot get it. Compacting gives an attempt more room, never more attempts."""
+        lm = FakeLM(lambda tid, msgs: [("read_file", {"path": "big.txt"})])       # never writes, never finishes
+        p = self._project({"max_attempts": 3})
+        try:
+            out = p.run(lm)
+            self.assertEqual(p.marks()["T01"], "!")                              # blocked after the 3rd attempt
+            self.assertIn("attempt 3/3", out)
+            self.assertNotIn("attempt 4/3", out)
+            self.assertGreaterEqual(lm.asked, 1)                                  # it did compact...
+            self.assertLessEqual(lm.asked, 3 * 2)                                 # ...at most max_compactions per attempt
+        finally:
+            lm.close()
+            p.close()
+
+    def test_facts_list_files_and_the_last_command(self):
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "a.py", "content": "x"})}},
+                    {"id": "2", "function": {"name": "run", "arguments": json.dumps({"cmd": "pytest -q"})}}]},
+                {"role": "tool", "tool_call_id": "2", "content": "exit 1\nFAILED test_a"}]
+        f = orca.attempt_facts(msgs)
+        self.assertIn("a.py", f)
+        self.assertIn("pytest -q", f)
+        self.assertIn("FAILED test_a", f)
+        self.assertEqual(orca.attempt_facts(msgs[:2]), "")
 
 
 class TestContextSetting(unittest.TestCase):

@@ -326,7 +326,8 @@ def draw(stdscr, P, st, ram, note, ui):
     busy_build = orca.running_pid(P) and str(st.get("phase", "")).startswith(("Qwen", "running tests", "smoke", "starting", "asking Claude", "course check"))
     ai.append(("%s  attempt %s/%s step %s%s" % (cur_task or "-", st.get("attempt", "-"), st.get("max_attempts", "-"), st.get("step", "-"),
                                                 "  " + orca.orca_bar(None, 16) if busy_build else ""), A["bold"]))
-    ai.append(("ctx %s %s/%s  thinking: %s" % (orca.bar(ctx / float(budget), 14), fmt_k(ctx), fmt_k(budget), st.get("think", "?")), A["info"] if ctx < budget * 0.8 else A["warn"]))
+    ai.append(("ctx %s %s/%s  thinking: %s%s" % (orca.bar(ctx / float(budget), 14), fmt_k(ctx), fmt_k(budget), st.get("think", "?"),
+                                                 "  compacted x%d" % st["compactions"] if st.get("compactions") else ""), A["info"] if ctx < budget * 0.8 else A["warn"]))
     for a_ in (st.get("actions") or [])[-4:]:
         ai.append(("> " + a_, A["info"]))
     wrap_w = max(10, w_ai - 3)
