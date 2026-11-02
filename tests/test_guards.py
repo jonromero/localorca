@@ -1168,6 +1168,19 @@ class TestContextSetting(unittest.TestCase):
         pv.proc, pv.retries = Alive(), 0
         self.assertFalse(pv.should_revive(now=999.0))          # running apps are left alone
 
+    def test_app_is_started_with_the_project_venv_first_on_path(self):
+        """ChessSquad's preview ran 'python3 app.py' with the system python: 'No module named flask', page said 'not answering'."""
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "venv", "bin"))
+            open(os.path.join(d, "venv", "bin", "python"), "w").close()
+            env = orca.venv_env(d, base={"PATH": "/usr/bin"})
+            self.assertTrue(env["PATH"].startswith(os.path.join(d, "venv", "bin") + os.pathsep))
+            self.assertEqual(env["VIRTUAL_ENV"], os.path.join(d, "venv"))
+            self.assertEqual(orca.venv_env(tempfile.gettempdir(), base={"PATH": "/usr/bin"})["PATH"], "/usr/bin")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_every_project_gets_its_own_preview_port(self):
         """ReadAlong's preview could not start because IslandSurvivor's held 7777, and the browser showed the wrong app."""
         import socket

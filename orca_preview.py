@@ -111,7 +111,7 @@ class Preview:
         log = open(str(self.P.o / "preview.out"), "a")
         log.write("\n--- %s starting: %s\n" % (time.strftime("%H:%M:%S"), self.cmd))
         log.flush()
-        env = dict(os.environ)
+        env = orca.venv_env(self.P.root)
         self.started = time.time()
         self.proc = subprocess.Popen(self.cmd, shell=True, cwd=str(self.P.root), stdout=log, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, start_new_session=True, env=env)

@@ -137,6 +137,9 @@ def main(argv):
         else:
             url = "%s:%d" % (url, port)
         env = dict(os.environ, PORT=str(port))
+        if (root / "venv" / "bin" / "python").exists():                     # the app's own venv, even when we were started outside it
+            env["VIRTUAL_ENV"] = str(root / "venv")
+            env["PATH"] = str(root / "venv" / "bin") + os.pathsep + env.get("PATH", "")
         cmd = re.sub(r"\bPORT=\d+", "PORT=%d" % port, cmd)      # a hardcoded "PORT=8080 node server.js" must follow the free port too
         proc = subprocess.Popen(cmd, shell=True, cwd=str(root), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, preexec_fn=os.setsid)

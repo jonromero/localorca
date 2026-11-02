@@ -903,6 +903,7 @@ def choose_preview_port(P):
     for i in range(60):
         port = 7777 + (start - 7777 + i) % 60
         s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)     # a port in TIME_WAIT from the last preview is still free
         try:
             s.bind(("127.0.0.1", port))
             return port
@@ -1155,12 +1156,18 @@ def claude_model_now(cfg):
     return cfg.get("claude_model", "") or ""
 
 
+def P_cfg():
+    return getattr(CUR, "cfg", None) or {}
+
+
 def note_claude_model(j):
     """Remember which Claude model really answered (from modelUsage in claude's JSON output)."""
     mu = j.get("modelUsage") or {}
     if not mu or CUR is None:
         return
-    name = max(mu, key=lambda k: (mu[k] or {}).get("outputTokens", 0) if isinstance(mu[k], dict) else 0)
+    want = (claude_model_now(P_cfg()) or "").lower()
+    named = [k for k in mu if want and want in k.lower()]      # Claude Code also runs small helper calls on haiku: the model WE asked for wins
+    name = named[0] if named else max(mu, key=lambda k: (mu[k] or {}).get("outputTokens", 0) if isinstance(mu[k], dict) else 0)
     p = CUR.o / "usage.json"
     try:
         d = json.loads(p.read_text())
@@ -2413,6 +2420,18 @@ def checkpoint(P, why):
     log("   status: %s" % status[:150])
     log("   course check: %d change(s) applied, %d rejected (orca/CHECKPOINT.md)" % (len(applied), len(rejected)))
     P.commit("orca: course check")
+
+
+def venv_env(root, base=None, **extra):
+    """Environment for starting the user's app: the project venv (if any) first on PATH, whatever process we run in."""
+    env = dict(os.environ if base is None else base)
+    v = Path(root) / "venv"
+    if (v / "bin" / "python").exists():
+        env["VIRTUAL_ENV"] = str(v)
+        env["PATH"] = str(v / "bin") + os.pathsep + env.get("PATH", "")
+        env.pop("PYTHONHOME", None)
+    env.update({k: str(x) for k, x in extra.items()})
+    return env
 
 
 def ensure_venv(P):
