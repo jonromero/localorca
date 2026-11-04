@@ -116,6 +116,24 @@ def proto(P):
         return {}
 
 
+def mark_run(P, **kw):
+    """PROTOTYPE.json remembers each design run: started (it began), ended (it reached its end), stopped (why it quit early).
+    A run that started but never ended, with no reason, was killed from outside (SIGKILL, a crash of Python itself)."""
+    pr = proto(P)
+    pr.update(kw)
+    P.wr("PROTOTYPE.json", json.dumps(pr, indent=1) + "\n")
+
+
+def design_stopped(P):
+    """None, or why the last design run quit before it finished (shown in the dashboard instead of "not built yet")."""
+    if orca.running_pid(P):
+        return None
+    pr = proto(P)
+    if not pr.get("started") or (pr.get("ended") or 0) >= pr["started"]:
+        return None
+    return pr.get("stopped") or "the design process was killed from outside, with no error logged (see orca/run.out)"
+
+
 def notes(P):
     out = []
     for line in P.rd("DESIGN_NOTES.md").splitlines():
@@ -498,11 +516,40 @@ def finish_round(P, ok, text, out, rev, applied=()):
     orca.set_state(phase="design review: look, add notes, then hand off" if ok else "design: prototype checks FAIL", step=0)
 
 
+def _why(e):
+    if isinstance(e, KeyboardInterrupt):
+        return "stopped with Ctrl-C (or (K) in the dashboard)"
+    if isinstance(e, SystemExit):
+        return e.code if isinstance(e.code, str) else "exited with code %s" % e.code
+    return "crashed: %s: %s" % (type(e).__name__, e)
+
+
 def cmd_design(a):
+    """One design run. Whatever ends it early (an error, sys.exit, Ctrl-C, SIGTERM, SIGHUP) is written to PROTOTYPE.json,
+    so the dashboard can say "design stopped: why" instead of a quiet "not built yet"."""
     P = orca.Project(a.dir)
     pid = orca.running_pid(P)
     if pid:
         sys.exit(orca.already_running_help(P, pid))
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda n, f: sys.exit("stopped by signal %s" % signal.Signals(n).name))
+    P.o.mkdir(exist_ok=True)
+    mark_run(P, started=time.time(), stopped="")
+    try:
+        _design(a, P)
+    except BaseException as e:
+        if not (isinstance(e, SystemExit) and e.code in (None, 0)):
+            why = _why(e)
+            mark_run(P, stopped=why)
+            orca.log("DESIGN STOPPED before it finished: %s\n(b) in the dashboard starts it again "
+                     "(research is kept once SPEC.md is written)." % orca.clip(why, 400))
+            orca.set_state(phase="design stopped: " + why[:80])
+            raise
+    mark_run(P, ended=time.time())
+
+
+def _design(a, P):
     if stage(P) == "build" and P.tasks() and not getattr(a, "force", False):
         sys.exit("%s is already in the build stage (Qwen has tasks). The design stage is for new projects.\n"
                  "Add --force to go back to design (open tasks stay, the hand-off writes a fresh list)." % P.root)

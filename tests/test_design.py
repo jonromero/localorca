@@ -362,6 +362,45 @@ class TestDesignFreesMemory(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class TestDesignStoppedIsShown(unittest.TestCase):
+    """A design run that dies before the prototype must not look like "not built yet, press (b)" (real: LastSortie)."""
+
+    def test_research_failure_is_recorded_and_explained(self):
+        d = DesignProject()
+        try:
+            conf = json.loads((d.dir / "orca.json").read_text())
+            conf["claude_cmd"] = [str(d.tmp / "no-such-claude")]
+            (d.dir / "orca.json").write_text(json.dumps(conf))
+            rc, out = d.orca("design", str(d.dir))
+            self.assertNotEqual(rc, 0)
+            P = d.P()
+            self.assertIn("research failed", orca_design.design_stopped(P))
+            self.assertIn("DESIGN STOPPED", P.rd("events.log"))
+            rc, out = d.orca("run", str(d.dir))
+            self.assertIn("NO prototype yet", out)
+            self.assertIn("research failed", out)
+        finally:
+            d.close()
+
+    def test_killed_run_and_clean_run(self):
+        import orca_tui
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / "orca").mkdir()
+            (d / "orca" / "STAGE").write_text("design\n")
+            P = orca.Project(d)
+            orca_design.mark_run(P, started=100.0, stopped="")
+            self.assertIn("killed from outside", orca_design.design_stopped(P))
+            pid, title, lines, keys = orca_tui.attention(P, {})
+            self.assertIn("stopped before the prototype", title)
+            self.assertEqual(keys[0][0], "b")
+            orca_design.mark_run(P, ended=101.0)
+            self.assertIsNone(orca_design.design_stopped(P))
+            self.assertIsNone(orca_tui.attention(P, {}))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestYourTurnPopups(unittest.TestCase):
     def _P(self, files):
         d = Path(tempfile.mkdtemp())

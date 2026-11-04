@@ -2523,6 +2523,12 @@ def cmd_run(a):
     if not pid:
         migrate_notes_dir(P)
     if P.rd("STAGE").strip() == "design" and not getattr(a, "force", False):
+        import orca_design
+        if not orca_design.proto(P).get("revision"):
+            why = orca_design.design_stopped(P)
+            sys.exit("%s is in the DESIGN stage and has NO prototype yet%s.\n"
+                     "Build it first ((b) in the dashboard), then hand off to Qwen:\n"
+                     "  python3 orca.py design %s" % (P.root, " (the last design run stopped: %s)" % why if why else "", P.root))
         sys.exit("%s is in the DESIGN stage: Claude's prototype is waiting for your review.\n"
                  "Look at it ((P) in the dashboard), add notes ((n)), then hand off to Qwen:\n"
                  "  python3 orca.py handoff %s --go       (or (h) in the dashboard)" % (P.root, P.root))

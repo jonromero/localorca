@@ -383,7 +383,12 @@ def design_lines(P, height, width):
     """The left panel in the design stage: where the prototype stands, then your notes (open ones first)."""
     pr = orca_design.proto(P)
     busy = orca.running_pid(P)
-    if not pr.get("revision"):
+    stopped = None if busy else orca_design.design_stopped(P)
+    if not pr.get("revision") and stopped:
+        head = [("Design STOPPED before the prototype", A["bad"])]
+        head += [(l, A["warn"]) for l in textwrap.wrap(stopped, max(10, width - 2))[:3]]
+        head.append(("(b) start it again, details in orca/run.out", A["dim"]))
+    elif not pr.get("revision"):
         head = [("Prototype: not built yet", A["warn"]),
                 ("Claude is building it, watch on the right" if busy else "(b) let Claude build it", A["dim"])]
     elif pr.get("ok"):
@@ -392,6 +397,8 @@ def design_lines(P, height, width):
     else:
         head = [("Prototype v%d: checks FAIL" % pr["revision"], A["bad"]),
                 ("(b) Claude fixes it. Hand-off waits for green", A["dim"])]
+    if pr.get("revision") and stopped:
+        head.append(("last Claude round stopped: " + stopped, A["warn"]))
     if pr.get("revision") and pr.get("ok") and not busy:
         head += [("", 0), ("NEXT, in your browser (P):", A["bold"])]
         steps = pr.get("try") or ["click through every screen", "judge the LOOK and layout (logic is Qwen's job later)"]
@@ -510,6 +517,12 @@ def attention(P, st):
         pr = orca_design.proto(P)
         n_open = len(orca_design.open_notes(P))
         rev = pr.get("revision") or 0
+        stopped = orca_design.design_stopped(P)
+        if stopped and not rev:
+            return ("stopped-%s" % int(pr.get("started") or 0), "The design stopped before the prototype",
+                    ["Claude's design run ended early, so there is no prototype yet:", "", stopped, "",
+                     "Start it again. Research is kept once the spec is written. orca/run.out has the full log."],
+                    [("b", "start the design again"), ("a", "ask Claude")])
         if rev and pr.get("ok"):
             steps = pr.get("try") or ["Click through every screen.", "Judge the LOOK and layout. Logic that is still a placeholder is Qwen's job later."]
             lines = ["Tests pass and the app starts. Your turn: look at it and decide.", ""]
