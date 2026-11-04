@@ -1227,3 +1227,27 @@ class TestContextSetting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOneBuildAtATime(unittest.TestCase):
+    """Two (r) presses while the first build loaded the model started two builds on the same task (real: LastSortie)."""
+
+    def test_spawned_child_owns_the_pidfile_at_once_and_a_quitter_leaves_others_alone(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / "orca").mkdir()
+            P = orca.Project(d)
+            out = open(os.devnull, "w")
+            p = orca.spawn_owned(P, ["--help"], out)
+            self.assertEqual(P.rd("run.pid").strip(), str(p.pid))     # before the child did anything
+            p.wait()
+            out.close()
+            code = ("import sys; sys.path.insert(0, %r); import orca; P = orca.Project(%r); orca.claim_pidfile(P); "
+                    "P.wr('run.pid', '424242')") % (str(ROOT), str(d))
+            subprocess.run([sys.executable, "-c", code], check=True)
+            self.assertEqual(P.rd("run.pid").strip(), "424242")        # not ours any more: kept
+            code = "import sys; sys.path.insert(0, %r); import orca; orca.claim_pidfile(orca.Project(%r))" % (str(ROOT), str(d))
+            subprocess.run([sys.executable, "-c", code], check=True)
+            self.assertFalse((d / "orca" / "run.pid").exists())         # ours: removed on exit
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

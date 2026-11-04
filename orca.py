@@ -2481,6 +2481,25 @@ def untrack_runtime(P):
         log("stopped tracking runtime files that an older version had committed")
 
 
+def claim_pidfile(P):
+    """This process owns orca/run.pid now. On exit it removes the file only if it is still ours, so a duplicate that
+    quits can never erase the pid of the build that keeps running."""
+    me = str(os.getpid())
+    P.o.mkdir(exist_ok=True)
+    P.wr("run.pid", me)
+    atexit.register(lambda: P.rd("run.pid").strip() == me and (P.o / "run.pid").unlink())
+
+
+def spawn_owned(P, args, out):
+    """Starts `orca.py <args>` in the background and writes ITS pid to run.pid at once. Without this the dashboard saw
+    "nothing running" for the ~30 s the child spends loading the model, and a second (r) started a second build
+    (real: LastSortie, two builds 7 s apart on the same task)."""
+    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve())] + list(args),
+                         stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    P.wr("run.pid", str(p.pid))
+    return p
+
+
 def running_pid(P):
     """PID of a live orca run on this project, else None. A leftover run.pid of a dead process is ignored."""
     try:
@@ -2517,7 +2536,7 @@ def cmd_run(a):
     pid = running_pid(P)
     if pid and not getattr(a, "force", False):
         sys.exit(already_running_help(P, pid))
-    if not pid and (P.o / "run.pid").exists():
+    if not pid and (P.o / "run.pid").exists() and P.rd("run.pid").strip() != str(os.getpid()):
         (P.o / "run.pid").unlink()
         log("removed a stale run.pid (that process is gone)")
     if not pid:
@@ -2534,6 +2553,8 @@ def cmd_run(a):
                  "  python3 orca.py handoff %s --go       (or (h) in the dashboard)" % (P.root, P.root))
     if not P.cfg["test_cmd"]:
         sys.exit("orca.json has no test_cmd. Tests are the judge, set one.")
+    claim_pidfile(P)              # before loading the model: from here on a second run or (r) sees this one
+    set_state(phase="starting: loading the model")
     ensure_model(P)
     probe_thinking(P)
     gi = P.root / ".gitignore"
@@ -2547,8 +2568,6 @@ def cmd_run(a):
     if (P.o / "STOP").exists():
         (P.o / "STOP").unlink()
         log("removed the old STOP file from the last stop")
-    P.wr("run.pid", str(os.getpid()))
-    atexit.register(lambda: (P.o / "run.pid").exists() and (P.o / "run.pid").unlink())
     t_start = time.time()
     jlog(P, "sessions.jsonl", {"start": t_start, "pid": os.getpid()})
     atexit.register(lambda: jlog(P, "sessions.jsonl", {"start": t_start, "end": time.time()}))

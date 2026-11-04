@@ -554,9 +554,7 @@ def _design(a, P):
         sys.exit("%s is already in the build stage (Qwen has tasks). The design stage is for new projects.\n"
                  "Add --force to go back to design (open tasks stay, the hand-off writes a fresh list)." % P.root)
     set_stage(P, "design")
-    P.wr("run.pid", str(os.getpid()))
-    import atexit
-    atexit.register(lambda: (P.o / "run.pid").exists() and (P.o / "run.pid").unlink())
+    orca.claim_pidfile(P)
     if not (P.root / ".git").exists():
         orca.sh("git init -q", cwd=P.root)
     gi = P.root / ".gitignore"
@@ -627,9 +625,7 @@ def cmd_handoff(a):
         sys.exit("%s is not in the design stage, nothing to hand off" % P.root)
     if not proto(P).get("revision"):
         sys.exit("no prototype yet. Build it first: python3 orca.py design %s" % P.root)
-    P.wr("run.pid", str(os.getpid()))
-    import atexit
-    atexit.register(lambda: (P.o / "run.pid").exists() and (P.o / "run.pid").unlink())
+    orca.claim_pidfile(P)
     orca.set_state(task="hand-off", model="Claude", actions=[], ai_text="", step=0, phase="hand-off: checking the prototype")
     orca.ensure_venv(P)        # the same environment the prototype was checked in (real failure: "mypy: command not found")
     ok, out = check(P)
@@ -683,5 +679,4 @@ def start_bg(P, what, *extra):
     """Runs `orca.py design|handoff DIR` as its own process (like the build), so the dashboard stays live and K ends it."""
     P.o.mkdir(exist_ok=True)
     out = open(str(P.o / "run.out"), "a")
-    return subprocess.Popen([sys.executable, str(Path(orca.__file__).resolve()), what, str(P.root)] + list(extra),
-                            stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    return orca.spawn_owned(P, [what, str(P.root)] + list(extra), out)

@@ -1369,9 +1369,9 @@ def handle_key(stdscr, P, ui, ch):
             (P.o / "STOP").unlink()
         if not any(x["mark"] == " " for x in P.tasks()):
             return False, "no open [ ] tasks in TASKS.md. Add one with (e), then (r)"
-        start_build(P)
+        p = start_build(P)
         ui["screen"] = "main"
-        return False, "build started"
+        return False, "build started (pid %d): Qwen loads first, the task shows up in about 30 s" % p.pid
     if ch == ord("L"):
         return False, pick_model_dialog(stdscr, P)
     if ch == ord("C"):
@@ -1537,8 +1537,7 @@ def start_build(P):
     """The build runs as its own background process, so closing the dashboard does not stop it."""
     P.o.mkdir(exist_ok=True)
     out = open(str(P.o / "run.out"), "a")
-    return subprocess.Popen([sys.executable, str(Path(orca.__file__).resolve()), "run", str(P.root)],
-                            stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    return orca.spawn_owned(P, ["run", str(P.root)], out)
 
 
 def run(P, start_run=False):
