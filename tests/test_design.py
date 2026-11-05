@@ -605,6 +605,18 @@ class TestShKillsChildren(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+class TestProgressPanelShowsOpenTasks(unittest.TestCase):
+    def test_focus_is_the_running_task_else_the_first_open_one_else_the_last(self):
+        import orca_tui
+        tasks = [{"id": "T%02d" % i, "mark": "x"} for i in range(60)] + [{"id": "F06", "mark": " "}, {"id": "F07", "mark": " "}]
+        self.assertEqual(orca_tui.task_focus(tasks, "F07"), 61)
+        self.assertEqual(orca_tui.task_focus(tasks, "C14"), 60)       # stale state.json task while the model loads
+        self.assertEqual(orca_tui.task_focus(tasks, None), 60)
+        shown = orca_tui.window_around(tasks, orca_tui.task_focus(tasks, None), 10)
+        self.assertIn("F07", [t["id"] for t in shown])
+        self.assertEqual(orca_tui.task_focus([{"id": "T01", "mark": "x"}, {"id": "T02", "mark": "x"}], None), 1)
+        self.assertEqual(orca_tui.task_focus([], None), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

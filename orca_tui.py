@@ -85,6 +85,19 @@ def window_start(n, idx, height):
     return max(0, min(idx - height // 2, n - height))
 
 
+def task_focus(tasks, cur_task):
+    """Which task line the Progress panel keeps in view: the one Qwen works on, else the first open one (a task you just
+    added with (n)), else the last. It used to fall back to the TOP, so on a long list (LastSortie, 70 tasks) new tasks
+    at the bottom were never on screen while no task was running."""
+    for i, t in enumerate(tasks):
+        if t["id"] == cur_task and t["mark"] == " ":
+            return i
+    for i, t in enumerate(tasks):
+        if t["mark"] == " ":
+            return i
+    return max(len(tasks) - 1, 0)
+
+
 def window_around(items, idx, height):
     """Slice of items that keeps idx visible."""
     s = window_start(len(items), idx, height)
@@ -283,13 +296,11 @@ def draw(stdscr, P, st, ram, note, ui):
     ui["layout"]["files"] = (1, 0, h_files, lw, [c for _, _, c in shown])
 
     # tasks + usage
-    tl, ti = [], 0
+    tl, ti = [], task_focus(tasks, cur_task)
     for t in tasks:
         is_cur = (t["id"] == cur_task and t["mark"] == " ")
         mark = {"x": "[x]", "!": "[!]", " ": "[ ]"}[t["mark"]]
         attr = A["ok"] if t["mark"] == "x" else A["bad"] if t["mark"] == "!" else A["cur"] if is_cur else A["dim"]
-        if is_cur:
-            ti = len(tl)
         title = t["text"].split("|")[0].strip()
         tl.append(("%s %s %s" % (mark, t["id"], title), attr))
     body = h_tasks - 2 - 4
