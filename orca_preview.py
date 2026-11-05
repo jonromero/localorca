@@ -118,7 +118,9 @@ class Preview:
         self.app = "restarting"
         for _ in range(60):                # up to 30 s for the app to answer
             if self.proc.poll() is not None:
-                self.app = "crashed"
+                # it quit, but something answers on preview_url (another copy of your app, one you started yourself):
+                # the page works, so do not show "crashed" over a running game (real: LastSortie, port 8080 in use)
+                self.app = "running" if self.reachable() else "crashed"
                 return
             if self.reachable():
                 self.app = "running"
@@ -148,10 +150,27 @@ class Preview:
             return False
 
     def app_log(self):
+        """The end of the LAST app start only, so older starts and the preview's own noise do not look like the crash."""
         try:
-            return "\n".join((self.P.o / "preview.out").read_text(errors="replace").splitlines()[-12:])
+            lines = (self.P.o / "preview.out").read_text(errors="replace").splitlines()
         except OSError:
             return ""
+        starts = [i for i, l in enumerate(lines) if l.startswith("--- ") and " starting: " in l]
+        return "\n".join(lines[starts[-1]:][-12:] if starts else lines[-12:])
+
+    def still_mine(self):
+        """Only one preview per project. A newer one rewrites preview.pid, and then this one steps aside, otherwise both
+        restart the app on every commit and one of them always loses the port and reports a crash (real: LastSortie)."""
+        parts = self.P.rd("preview.pid").split()
+        if not parts:
+            self.P.wr("preview.pid", "%d %d" % (os.getpid(), self.port))      # lost (a cleanup removed it): take it back
+            return True
+        if parts[0] == str(os.getpid()):
+            return True
+        if orca.preview_pid(self.P):
+            return False
+        self.P.wr("preview.pid", "%d %d" % (os.getpid(), self.port))          # the other one is gone: take it back
+        return True
 
     REVIVE_AFTER = 10.0                    # seconds a dead app waits before the next automatic restart
     REVIVE_MAX = 3                         # then stop, so a crash loop does not spin forever
@@ -161,16 +180,22 @@ class Preview:
         until the next commit. (IslandSurvivor's app died after the last task and the preview just said 'not answering'.)"""
         now = time.time() if now is None else now
         return bool(self.cmd and self.proc is not None and self.proc.poll() is not None
-                    and self.retries < self.REVIVE_MAX and now - self.started >= self.REVIVE_AFTER)
+                    and self.retries < self.REVIVE_MAX and now - self.started >= self.REVIVE_AFTER and not self.reachable())
 
     def watch(self):
         """Restart the app whenever a task is committed (git HEAD moves). Mid-task edits are never shown."""
         while True:
             time.sleep(3)
+            if not self.still_mine():
+                orca.log("preview: a newer preview took over this project, this one (pid %d) stops" % os.getpid())
+                with self.lock:
+                    self.stop_app()
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
             h = self.git_head()
             died = self.cmd and self.proc is not None and self.proc.poll() is not None and self.app == "running"
             if died:
-                self.app = "crashed"
+                self.app = "running" if self.reachable() else "crashed"
             if h and h != self.head:
                 self.head = h
                 self.retries = 0
@@ -351,6 +376,12 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address):
+        """A browser closing a connection is normal. Its traceback filled preview.out and showed up as "your app crashed"."""
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
 
 def run(P):
     pv = Preview(P)
@@ -372,6 +403,7 @@ def run(P):
     finally:
         pv.stop_app()
         try:
-            (P.o / "preview.pid").unlink()
+            if P.rd("preview.pid").split()[:1] == [str(os.getpid())]:      # never remove a newer preview's pid
+                (P.o / "preview.pid").unlink()
         except OSError:
             pass

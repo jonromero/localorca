@@ -525,6 +525,35 @@ class TestAskBox(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class TestOnePreviewPerProject(unittest.TestCase):
+    """Two previews of LastSortie both restarted the app on port 8080; the loser showed "crashed" with a
+    ConnectionResetError traceback from the preview's own server, while the game ran fine."""
+
+    def test_older_preview_steps_aside_and_the_log_is_the_last_start_only(self):
+        import orca_preview
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / "orca").mkdir()
+            P = orca.Project(d)
+            pv = orca_preview.Preview.__new__(orca_preview.Preview)
+            pv.P, pv.port = P, 7790
+            self.assertTrue(pv.still_mine())                                  # no pid file: takes it
+            self.assertEqual(P.rd("preview.pid").split()[0], str(os.getpid()))
+            other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "orca"])
+            try:
+                P.wr("preview.pid", "%d 7791" % other.pid)                    # a newer, live preview
+                self.assertFalse(pv.still_mine())
+            finally:
+                other.kill()
+                other.wait()
+            self.assertTrue(pv.still_mine())                                  # it is gone: take it back
+            P.wr("preview.out", "--- 10:00:00 starting: npm start\nold crash\nTraceback: noise\n"
+                                "--- 10:05:00 starting: npm start\nError: Port 8080 is already in use\n")
+            self.assertEqual(pv.app_log(), "--- 10:05:00 starting: npm start\nError: Port 8080 is already in use")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestPreviewReload(unittest.TestCase):
     def test_a_notes_only_commit_does_not_reload_the_page(self):
         import orca_preview
