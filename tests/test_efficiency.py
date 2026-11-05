@@ -104,6 +104,27 @@ class TestTargetedTests(unittest.TestCase):
         self.assertIsNone(orca.targeted_cmd({"test_cmd": "npm run lint && node --test", "targeted_tests": True}, task, tmp.parent))
 
 
+class TestAcceptanceFilesAreTests(unittest.TestCase):
+    def test_never_split_and_never_in_the_targeted_run(self):
+        """Hearth rerun: the auto-split queued "Split acceptance/acc_content.py", a read-only file (a task that can never pass)."""
+        self.assertTrue(orca.is_test_file("acceptance/acc_content.py"))
+        self.assertTrue(orca.is_test_file("acceptance/hold.acc.mjs"))
+        self.assertFalse(orca.is_test_file("src/accounts.py"))
+        p = acc_project([])
+        try:
+            (p.dir / "acceptance" / "acc_basic.py").write_text(ACC + "\n" * 400)
+            (p.dir / "big.py").write_text("x = 1\n" * 400)
+            for args in (["add", "-A"], ["commit", "-qm", "x"]):
+                subprocess.run(["git"] + args, cwd=p.dir, check=True)
+            P = orca.Project(p.dir)
+            self.assertEqual(orca.queue_splits(P), "big.py")
+            self.assertNotIn("acceptance/", P.rd("TASKS.md"))
+            c = {"test_cmd": "python -m pytest -q", "targeted_tests": True}
+            self.assertIsNone(orca.targeted_cmd(c, "T01: x | files: acceptance/acc_basic.py | done when: y", p.dir))
+        finally:
+            p.close()
+
+
 class TestGiveUpEarly(unittest.TestCase):
     def test_same_failure_with_no_help_left_stops_at_3_not_5(self):
         bad = "import unittest\nclass T(unittest.TestCase):\n    def test_x(self): self.assertEqual(1, 2)\n"

@@ -1896,10 +1896,15 @@ def file_api(path, text):
     return out
 
 
+def is_acceptance_file(path):
+    """The read-only acceptance tests (orca_accept.py): never split, never run by the targeted test command."""
+    return path.startswith("acceptance/") or ".acc." in path.rsplit("/", 1)[-1]
+
+
 def is_test_file(path):
     base = path.rsplit("/", 1)[-1]
     return (".test." in base or ".spec." in base or base.startswith("test_") or base.endswith("_test.py")
-            or path.startswith(("test/", "tests/")))
+            or path.startswith(("test/", "tests/")) or is_acceptance_file(path))
 
 
 def code_map(P, task=None, cap=None):
@@ -2175,7 +2180,7 @@ def targeted_cmd(c, task_text, root):
     if not m or not files_part or re.search(r"[&|;]", c["test_cmd"]):
         return None
     files = [f.strip().split()[-1] for f in files_part.group(1).split(",") if f.strip()]
-    tests = [f for f in files if is_test_file(f) and (Path(root) / f).is_file()]
+    tests = [f for f in files if is_test_file(f) and not is_acceptance_file(f) and (Path(root) / f).is_file()]
     if not tests:
         return None
     base = m.group(1).strip() if m.group(1).startswith("node") else c["test_cmd"].strip()
