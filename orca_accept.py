@@ -99,6 +99,42 @@ def restore(P):
         P.git("clean -fdq -- %s" % d)
 
 
+def suspended(P):
+    return set((state(P).get("suspended") or {}).keys())
+
+
+def suspend(P, ids, why):
+    """An acceptance test Claude judged WRONG (it contradicts the brief, or crashes in its own code before it checks the
+    product) stops judging tasks. It is kept and listed for the course check and the owner. (Real failure: A42 called a
+    helper with the wrong object and died with a TypeError, so no code could make it pass and two tasks blocked.)"""
+    st = state(P)
+    sus = st.get("suspended") or {}
+    for i in ids:
+        sus[i] = why[:200]
+    st["suspended"] = sus
+    save_state(P, st)
+
+
+def test_source(P, ids, cap=4000):
+    """The code of these acceptance tests (from the line that names the id, up to the next test), for Claude to judge."""
+    d = P.root / P.cfg.get("acceptance_dir", "acceptance")
+    out = []
+    for f in sorted(d.rglob("*")) if d.exists() else []:
+        if not f.is_file() or f.suffix not in (".py", ".js", ".mjs", ".ts", ".cjs"):
+            continue
+        lines = f.read_text(errors="replace").splitlines()
+        for n, line in enumerate(lines):
+            if any(re.search(r"(?<![A-Za-z0-9])%s(?!\d)" % i, line) for i in ids) and re.search(r"\b(def|test|it)\b", line):
+                end = n + 1
+                while end < len(lines) and end - n < 40 and not re.match(r"^(def |async def |test\(|it\(|\S)", lines[end]):
+                    end += 1
+                out.append("%s:%d\n%s" % (f.relative_to(P.root), n + 1, "\n".join(lines[n:end])))
+    helpers = [f for f in sorted(d.glob("*")) if f.is_file() and re.search(r"support|helper|conftest", f.name)] if d.exists() else []
+    for f in helpers:
+        out.append("%s (helpers)\n%s" % (f.relative_to(P.root), orca.clip(f.read_text(errors="replace"), 1500)))
+    return orca.clip("\n\n".join(out), cap)
+
+
 def gate(P, task, last_attempt):
     """Check one task against the acceptance tests after its own tests pass.
     Returns (ok, message for Qwen, note for the log). Regressions always fail. A task's own ids fail it too, except on
@@ -115,9 +151,10 @@ def gate(P, task, last_attempt):
             return False, "The ACCEPTANCE tests (read-only, written from the brief) passed before this task and fail now:\n" + orca.clip(out, 3000), "acceptance regressed"
         save_state(P, st)
         return True, "", ""
+    sus = set((st.get("suspended") or {}).keys())
     passing = set(st.get("passing", []))
-    broke = sorted(i for i in passing if res.get(i) is False)
-    mine = [i for i in task_ids(task["text"]) if not res.get(i)]
+    broke = sorted(i for i in passing - sus if res.get(i) is False)
+    mine = [i for i in task_ids(task["text"]) if not res.get(i) and i not in sus]
     nm = names(P)
     desc = lambda ids: "\n".join("  %s: %s" % (i, nm.get(i, "")) for i in ids)
     folder = P.cfg.get("acceptance_dir", "acceptance")
@@ -126,7 +163,7 @@ def gate(P, task, last_attempt):
                        "fix the real code, never the tests):\n%s\n%s" % (folder, desc(broke), failure_excerpt(out, broke))), \
             "breaks " + " ".join(broke)
     if mine and not last_attempt:
-        return False, ("Your own tests pass, but this task must also make these ACCEPTANCE tests pass (read-only, in %s/, "
+        return False, ("ACCEPTANCE-ONLY. " +"Your own tests pass, but this task must also make these ACCEPTANCE tests pass (read-only, in %s/, "
                        "written from the brief: read them to see exactly what is expected, then fix the real code):\n%s\n%s"
                        % (folder, desc(mine), failure_excerpt(out, mine))), "needs " + " ".join(mine)
     st["passing"] = sorted(set(passing) | {i for i, ok in res.items() if ok})
@@ -137,6 +174,28 @@ def gate(P, task, last_attempt):
     save_state(P, st)
     note = "acceptance %d/%d" % (sum(res.values()), len(res)) + (" (kept, but %s still fail)" % " ".join(mine) if mine else "")
     return True, "", note
+
+
+def only_needs(msg):
+    """True if a failed attempt failed ONLY on its own acceptance ids (its own tests pass, nothing regressed)."""
+    return (msg or "").startswith("ACCEPTANCE-ONLY.")
+
+
+def keep_with_debt(P, task):
+    """The task would block, but its own tests pass and only its acceptance ids fail: keep the work (rolling it back
+    would also block every task built on it), and leave the ids open for the course check."""
+    st = state(P)
+    res, rc, out = run(P)
+    sus = set((st.get("suspended") or {}).keys())
+    passing = set(st.get("passing", []))
+    if any(res.get(i) is False for i in passing - sus):
+        return False
+    st["passing"] = sorted(passing | {i for i, ok in res.items() if ok})
+    st["last"] = {i: ok for i, ok in sorted(res.items())}
+    st["total"] = len(res)
+    st["debt"] = sorted(set(st.get("debt", [])) | {i for i in task_ids(task["text"]) if not res.get(i)})
+    save_state(P, st)
+    return True
 
 
 def baseline(P):
@@ -158,6 +217,9 @@ def summary(P, cap=2500):
     nm = names(P)
     bad = [i for i, ok in sorted(last.items()) if not ok]
     head = "%d of %d acceptance tests pass." % (len(last) - len(bad), len(last))
+    sus = st.get("suspended") or {}
+    if sus:
+        head += "\nSUSPENDED (judged wrong, not judging tasks; fix or rewrite them): " + "; ".join("%s %s" % kv for kv in sorted(sus.items()))
     claimed = {}
     for t in P.tasks():
         for i in task_ids(t["text"]):

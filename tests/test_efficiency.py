@@ -196,6 +196,43 @@ class TestAcceptance(unittest.TestCase):
             lm.close()
             p.close()
 
+    def test_good_work_is_kept_when_only_acceptance_fails(self):
+        """Hearth rerun: T03 blocked only on its acceptance id and was rolled back, so T04, built on it, blocked too."""
+        def brain(tid, msgs):
+            return [write("feature.py", "def f():\n    return 1\n"), ("done", {"summary": "ok"})]
+        lm = FakeLM(brain)
+        p = acc_project(["- [ ] T01: feature f | done when: a test shows f | accept: A01"], passing=["A02"], max_attempts=5)
+        try:
+            out = p.run(lm)
+            self.assertIn("giving up early", out)
+            self.assertIn("PASS with open acceptance tests", out)
+            self.assertEqual(p.marks()["T01"], "x")
+            self.assertTrue((p.dir / "feature.py").exists())
+            self.assertEqual(json.loads((p.dir / "orca" / "ACCEPTANCE.json").read_text())["debt"], ["A01"])
+        finally:
+            lm.close()
+            p.close()
+
+    def test_claude_can_suspend_a_wrong_acceptance_test(self):
+        """A42 crashed in its own helper call (TypeError): the escalation sees the test code and may judge it wrong."""
+        def brain(tid, msgs):
+            return [write("feature.py", "def f():\n    return 1\n"), ("done", {"summary": "ok"})]
+        lm = FakeLM(brain)
+        p = acc_project(["- [ ] T01: feature f | done when: a test shows f | accept: A01"], passing=["A02"],
+                        max_attempts=4, max_escalations=1)
+        (p.tmp / "claude_escalate.txt").write_text("The product is fine.\nACCEPTANCE_WRONG: A01 crashes in its own helper\n")
+        try:
+            out = p.run(lm)
+            self.assertIn("acceptance test A01 is WRONG", out)
+            st = json.loads((p.dir / "orca" / "ACCEPTANCE.json").read_text())
+            self.assertIn("A01", st["suspended"])
+            self.assertEqual(p.marks()["T01"], "x")
+            self.assertIn("test_A01_feature_doubles", (p.tmp / "claude_stdin.txt").read_text())
+            self.assertIn("SUSPENDED", orca_accept.summary(orca.Project(p.dir)))
+        finally:
+            lm.close()
+            p.close()
+
     def test_builder_prompt_names_the_tasks_acceptance_tests(self):
         P = orca.Project(Path(acc_project([]).dir))
         P.cfg["acceptance_cmd"] = ACC_CMD

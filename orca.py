@@ -155,6 +155,10 @@ TEST OUTPUT:
 WORKING TREE STATUS AND DIFF:
 """
 
+ACCEPT_JUDGE = """
+Some failures are ACCEPTANCE tests (their code and the brief come first in the input). The builder cannot change them. Judge each one: if the test itself is WRONG, because it contradicts the brief or it crashes in its own code before it checks the product (a wrong helper call, a TypeError in the test), add one line `ACCEPTANCE_WRONG: <id> <why, one line>` per wrong test: it stops judging tasks. Otherwise the product is wrong: tell the builder exactly what the test expects.
+"""
+
 CHECKPOINT_PROMPT = """You are the product lead for a build run by a small local coding model. Your ONE job: get to a working app someone could use or demo, as fast as possible, then grow it.
 You are given the owner's BRIEF, the spec, the ACCEPTANCE test results (read-only tests written from the brief), the task list (x done, ! blocked, open ones have a space), recent progress, build numbers, and the result of starting the REAL app{shot_note}.
 Judge against the BRIEF and the acceptance results, not only the task list: the plan can be wrong. A failing acceptance test that no open task claims needs an ADD that ends `| accept: <its id>`. A brief requirement that is missing from both the tasks and the acceptance list needs an ADD too.
@@ -2216,7 +2220,20 @@ def escalate(P, task, fail, n):
     prompt = ESCALATE_PROMPT.replace("{n}", str(n)).replace("{spec}", clip(P.rd("SPEC.md"), 3000)) \
         .replace("{task}", "%s: %s" % (task["id"], task["text"])).replace("{fail}", clip(fail, 3000)) \
         .replace("{lessons}", clip(P.rd("LESSONS.md").strip() or "(none yet)", 2500))
+    acc_ids = [i for i in orca_accept.task_ids(task["text"]) if re.search(r"(?<![A-Za-z0-9])%s(?!\d)" % i, fail)] \
+        if orca_accept.active(P) else []
+    if acc_ids:
+        prompt += ACCEPT_JUDGE
+        stdin = "ACCEPTANCE TESTS THAT FAIL (read-only for the builder, written from the brief):\n" + \
+            orca_accept.test_source(P, acc_ids) + "\n\nOWNER'S BRIEF (head):\n" + clip(P.rd("BRIEF.md"), 3000) + "\n\n" + stdin
     reply = ask_claude(P.cfg, prompt, stdin, purpose="escalate", extra_args=NO_TOOLS) or ""
+    wrong = re.findall(r"^\s*ACCEPTANCE_WRONG:\s*(A\d{2,3})\b\s*(.*)$", reply, flags=re.M)
+    wrong = [(i, why) for i, why in wrong if i in acc_ids]
+    if wrong:
+        orca_accept.suspend(P, [i for i, _ in wrong], "; ".join(w for _, w in wrong) or "judged wrong by Claude")
+        for i, why in wrong:
+            log("  Claude: acceptance test %s is WRONG (%s), it no longer judges tasks" % (i, why[:150]))
+        reply = "\n".join(l for l in reply.splitlines() if not l.strip().startswith("ACCEPTANCE_WRONG:"))
     hint, lesson = split_lesson(reply)
     if lesson and P.cfg.get("escalate_lessons", True) and lesson_is_new(P.rd("LESSONS.md"), lesson):
         log("  lesson from Claude: " + lesson)
@@ -2403,6 +2420,14 @@ def do_task(P, task):
             # no help left and the same error again: more attempts repeat it (benchmark: 5 identical failures, 22 min)
             log(" same failure %d times and no escalation left, giving up early" % sigs.count(sig))
             break
+    if orca_accept.only_needs(out) and orca_accept.keep_with_debt(P, task):
+        # own tests green, nothing regressed, only this task's acceptance ids still fail: blocking would roll back good
+        # work AND block every task built on it (real: T03 spaces blocked on a broken acceptance test, so T04 threads did too)
+        P.mark(tid, "x")
+        P.add_progress("%s done, but acceptance %s still fail (left for the course check)" % (tid, " ".join(orca_accept.task_ids(task["text"]))))
+        P.commit("%s: %s (acceptance still open)" % (tid, task["text"].split("|")[0].strip()))
+        log(" PASS with open acceptance tests (kept: own tests pass, nothing regressed)")
+        return True
     (P.o / "failed").mkdir(parents=True, exist_ok=True)
     diff = work_diff(P)              # includes NEW files, so `git apply orca/failed/T17.diff` brings everything back
     (P.o / "failed" / (tid + ".diff")).write_text(diff)

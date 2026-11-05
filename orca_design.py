@@ -92,7 +92,7 @@ Write them in `{folder}/` (black-box, through the product's real public surface:
 4/ A command that runs them all with per-test results in its output: pytest `python -m pytest -q -rA {folder}/acc_*.py`, node `node --test --test-reporter=tap {folder}/*.acc.mjs`.
 5/ Tests that need the app running start it themselves (a test client, an import, or a subprocess on a free port). No browsers.
 6/ Write orca/ACCEPTANCE.md: one line per id, `A07: Left moves the piece one column | brief: "Left and Right arrows move one column"` (the brief's own words). Every requirement of the brief must have a line.
-Run the command: the tests must RUN (failures are expected, crashes and import errors are not), and `{test_cmd}` must still pass. Do not change the product code. Do not commit.
+Run the command: the tests must RUN (failures are expected, crashes and import errors are not), and `{test_cmd}` must still pass. A test may fail ONLY on an assert about the product: read every failure and fix any that dies in the test's own code (a TypeError, a wrong helper argument, a KeyError on a response the test itself built). Nobody can fix those later. Do not change the product code. Do not commit.
 Reply with at most 5 lines: how many tests, which already pass. The LAST line must be exactly: `ACCEPTANCE_CMD: <the command>`
 """
 
