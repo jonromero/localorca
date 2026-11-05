@@ -35,6 +35,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import orca_accept      # acceptance tests from the brief (uses orca's helpers at call time only)
+
 DEFAULTS = {
     "base_url": "http://localhost:1234/v1",
     "model": "",                 # blank = first model LM Studio reports
@@ -56,14 +58,19 @@ DEFAULTS = {
     "setup_cmd": "",
     "venv": "auto",              # auto | true | false. Python projects get <project>/venv
     "max_attempts": 5,           # attempts per task
-    "same_fail_escalate": 3,     # same failure this many times -> ask Claude
+    "same_fail_escalate": 2,     # same failure this many times -> ask Claude (benchmarks: 3 wasted a full attempt each time)
     "escalate_after": 3,         # ...or after this many failed attempts, even if the failures differ (close-but-not-quite loops)
     "max_escalations": 2,
+    "give_up_same_fail": 3,      # the same failure this many times with no escalation left -> block now, not after max_attempts
+    "targeted_tests": True,      # run the task's own test files first; the full suite only when they pass (fails fast)
+    "acceptance": True,          # hand-off: Claude writes acceptance tests from the brief (false = off)
+    "acceptance_cmd": "",        # runs the read-only acceptance tests Claude wrote from the brief at hand-off (set by the hand-off)
+    "acceptance_dir": "acceptance",
     "max_steps": 30,             # tool calls per attempt
     "compact_at": 0.8,           # when the chat reaches this share of prompt_budget_tokens, Qwen writes notes and a fresh chat replaces it (0 = off)
     "max_compactions": 2,        # compactions per attempt
     "halt_after_blocked": 2,     # stop the run after N blocked tasks in a row
-    "checkpoint_every": 8,       # course check: Claude looks at the RUNNING app and fixes the open task list every N passing tasks (0 = off)
+    "checkpoint_every": 10,      # course check: Claude looks at the RUNNING app and fixes the open task list every N passing tasks (0 = off)
     "checkpoint_minutes": 90,    # ...or after this many minutes since the last check (0 = no time trigger)
     "checkpoint_max_add": 5,     # caps per check, so a check steers instead of rewriting the plan
     "checkpoint_max_remove": 5,
@@ -149,7 +156,8 @@ WORKING TREE STATUS AND DIFF:
 """
 
 CHECKPOINT_PROMPT = """You are the product lead for a build run by a small local coding model. Your ONE job: get to a working app someone could use or demo, as fast as possible, then grow it.
-You are given the spec, the task list (x done, ! blocked, open ones have a space), recent progress, build numbers, and the result of starting the REAL app{shot_note}.
+You are given the owner's BRIEF, the spec, the ACCEPTANCE test results (read-only tests written from the brief), the task list (x done, ! blocked, open ones have a space), recent progress, build numbers, and the result of starting the REAL app{shot_note}.
+Judge against the BRIEF and the acceptance results, not only the task list: the plan can be wrong. A failing acceptance test that no open task claims needs an ADD that ends `| accept: <its id>`. A brief requirement that is missing from both the tasks and the acceptance list needs an ADD too.
 Answer in this exact format and nothing else:
 STATUS: <one line: what works for a user right now, honestly>
 DEMO: <one line: the shortest path from here to a usable demo>
@@ -159,8 +167,14 @@ ADD: <open task id to insert before, or END> | <task text> | done when: <what a 
 MOVE: <open task id> | <open task id to move before, or END>
 Rules: only touch OPEN tasks. Each new task is small (one function, at most 3 behaviours, one new test file), a vertical slice that adds something visible or usable to the running app, and its done-when is checked by the test command with REAL code (fakes only for the outside world). Prefer fixing what blocks the running app over new features. If the plan is on track, write no change lines.
 
+BRIEF:
+{brief}
+
 SPEC:
 {spec}
+
+ACCEPTANCE:
+{acceptance}
 
 TASKS:
 {tasks}
@@ -1215,6 +1229,11 @@ class Heartbeat:
         print("  done: %s (%s)" % (self.label, self._elapsed()), flush=True)
 
 
+# Calls that only read their prompt get no built-in tools: the default tool set is ~9k cached tokens per call
+# (measured: $0.039 vs $0.009 for the same one-word answer).
+NO_TOOLS = ["--tools", ""]
+
+
 def ask_claude(cfg, prompt, stdin_text="", purpose="misc", progress=None, hint="", cwd=None, extra_args=()):
     model = claude_model_now(cfg)
     cmd = list(cfg["claude_cmd"]) + (["--model", model] if model else []) + list(extra_args) + ["--output-format", "json", prompt]
@@ -1702,6 +1721,10 @@ def run_tool(P, name, args):
             if any(OMIT_RE.search(str(args.get(k, ""))) for k in ("content", "old", "new")):
                 return ("ERROR: you sent the history placeholder ('ORCA-OMITTED ... chars') instead of real text. "
                         "Nothing was written. read_file to see the current text, then send the full real content.")
+            acc = P.cfg.get("acceptance_dir", "acceptance")
+            if orca_accept.active(P) and (rel == acc or rel.startswith(acc + "/")):
+                return ("ERROR: %s/ holds the ACCEPTANCE tests, written from the brief. They are read-only: read them to see "
+                        "what the brief expects, then change the real code so they pass." % acc)
             if rel in P.protected():
                 return ("ERROR: %s is PROTECTED. The user edited it by hand and asked that it is not changed during this task. "
                         "Do not write to it. Work around it, or call done and say what it blocks." % rel)
@@ -1953,6 +1976,11 @@ def build_prompt(P, task, hint, last_fail):
         parts.append("# EXTRA FOLDERS (read-only, use these absolute paths with list_files / read_file)\n" +
                      "\n".join("%s  (%s)" % (d, dir_summary(d)) for d in ex))
     parts.append("# CURRENT TASK\n%s: %s\nTest command: %s" % (task["id"], task["text"], c["test_cmd"]))
+    ids = orca_accept.task_ids(task["text"]) if orca_accept.active(P) else []
+    if ids:
+        nm = orca_accept.names(P)
+        parts.append("# ACCEPTANCE TESTS THIS TASK MUST MAKE PASS (read-only, in %s/, written from the brief; run `%s` to see them)\n%s"
+                     % (c.get("acceptance_dir", "acceptance"), c["acceptance_cmd"], "\n".join("%s: %s" % (i, nm.get(i, "")) for i in ids)))
     if hint:
         parts.append("# SENIOR ENGINEER HINT (follow it)\n" + hint)
     if last_fail:
@@ -2119,6 +2147,56 @@ def ram_guard(P):
 
 
 # ---------------------------------------------------------------- task loop
+def test_count(out):
+    """How many tests a run reports, or None if we cannot tell. node --test with no test files exits 0 with "# tests 0",
+    which used to count as a pass (benchmark: Qwen alone shipped a game with zero tests)."""
+    t = out or ""
+    for pat in (r"^#\s*tests\s+(\d+)", r"^\u2139\s*tests\s+(\d+)", r"Tests:\s+.*?(\d+)\s+total", r"^Ran (\d+) tests?"):
+        m = re.findall(pat, t, flags=re.M)
+        if m:
+            return int(m[-1])
+    if re.search(r"no tests ran|collected 0 items", t):
+        return 0
+    m = re.findall(r"(\d+) (?:passed|failed|errors?)\b", t)
+    if m:
+        return sum(int(x) for x in m)
+    return None
+
+
+TEST_RUNNERS = re.compile(r"^\s*((?:python3?\s+-m\s+)?pytest\b[^&|;]*|node\s+--test\b)")
+
+
+def targeted_cmd(c, task_text, root):
+    """The test command limited to the test files this task names (that exist now), or None."""
+    if not c.get("targeted_tests", True):
+        return None
+    m = TEST_RUNNERS.match(c.get("test_cmd") or "")
+    files_part = re.search(r"\|\s*files:\s*([^|]+)", task_text or "")
+    if not m or not files_part or re.search(r"[&|;]", c["test_cmd"]):
+        return None
+    files = [f.strip().split()[-1] for f in files_part.group(1).split(",") if f.strip()]
+    tests = [f for f in files if is_test_file(f) and (Path(root) / f).is_file()]
+    if not tests:
+        return None
+    base = m.group(1).strip() if m.group(1).startswith("node") else c["test_cmd"].strip()
+    return base + " " + " ".join(shlex.quote(t) for t in tests)
+
+
+def run_tests(P, task):
+    """Tests for one attempt: the task's own files first (fast fail), then the whole suite. Zero tests never pass."""
+    c = P.cfg
+    quick = targeted_cmd(c, task["text"], P.root)
+    if quick:
+        rc, out = sh(quick, cwd=P.root, timeout=c["cmd_timeout"] * 3)
+        if rc != 0:
+            return rc, "(only this task's test files were run: %s)\n%s" % (quick, out)
+    rc, out = sh(c["test_cmd"], cwd=P.root, timeout=c["cmd_timeout"] * 3)
+    if rc == 0 and test_count(out) == 0:
+        rc, out = 1, ("NO TESTS RAN. `%s` exits 0 but reports zero tests, so nothing is checked. Write tests for this task "
+                      "where the test command finds them.\n%s" % (c["test_cmd"], out))
+    return rc, out
+
+
 def signature(out):
     t = re.sub(r"0x[0-9a-f]+|\d+(\.\d+)?", "N", out[-800:])
     return hashlib.md5(t.encode()).hexdigest()[:10]
@@ -2133,7 +2211,7 @@ def escalate(P, task, fail, n):
     prompt = ESCALATE_PROMPT.replace("{n}", str(n)).replace("{spec}", clip(P.rd("SPEC.md"), 3000)) \
         .replace("{task}", "%s: %s" % (task["id"], task["text"])).replace("{fail}", clip(fail, 3000)) \
         .replace("{lessons}", clip(P.rd("LESSONS.md").strip() or "(none yet)", 2500))
-    reply = ask_claude(P.cfg, prompt, stdin, purpose="escalate") or ""
+    reply = ask_claude(P.cfg, prompt, stdin, purpose="escalate", extra_args=NO_TOOLS) or ""
     hint, lesson = split_lesson(reply)
     if lesson and P.cfg.get("escalate_lessons", True) and lesson_is_new(P.rd("LESSONS.md"), lesson):
         log("  lesson from Claude: " + lesson)
@@ -2272,7 +2350,8 @@ def do_task(P, task):
         # Work left by an earlier attempt of the SAME task counts too (it was not committed yet).
         changed = before is None or after != before or (attempt > 1 and bool(after) and after != task_start)
         set_state(phase="running tests")
-        rc, out = sh(c["test_cmd"], cwd=P.root, timeout=c["cmd_timeout"] * 3)
+        orca_accept.restore(P)          # the acceptance tests are the brief's judge: Qwen never changes them
+        rc, out = run_tests(P, task)
         lazy = summary in ("step limit reached", "context budget exhausted") or summary.startswith("LM Studio error")
         if rc == 0 and not changed and (tid[:1] != "R" or lazy):
             # Tests that were already green prove nothing: a feature task with no file changes is not done.
@@ -2289,6 +2368,13 @@ def do_task(P, task):
                 log(" REAL APP SMOKE TEST FAILED")
                 rc, out = 1, ("The unit tests pass, but the REAL APP is broken. It was started with preview_cmd and opened in a "
                               "headless browser. Fix the real code (not the tests). Do not fake anything.\n" + sout)
+        if rc == 0 and orca_accept.active(P):
+            set_state(phase="acceptance tests")
+            ok, msg, note = orca_accept.gate(P, task, last_attempt=attempt == c["max_attempts"])
+            if note:
+                log(" " + note)
+            if not ok:
+                rc, out = 1, msg
         if rc == 0:
             P.mark(tid, "x")
             P.add_progress("%s done: %s" % (tid, summary[:160]))
@@ -2308,6 +2394,10 @@ def do_task(P, task):
             hint = escalate(P, task, last_fail, sigs.count(sig))
             escal += 1
             sigs = []
+        elif sigs.count(sig) >= c.get("give_up_same_fail", 3) and attempt < c["max_attempts"]:
+            # no help left and the same error again: more attempts repeat it (benchmark: 5 identical failures, 22 min)
+            log(" same failure %d times and no escalation left, giving up early" % sigs.count(sig))
+            break
     (P.o / "failed").mkdir(parents=True, exist_ok=True)
     diff = work_diff(P)              # includes NEW files, so `git apply orca/failed/T17.diff` brings everything back
     (P.o / "failed" / (tid + ".diff")).write_text(diff)
@@ -2401,13 +2491,15 @@ def checkpoint(P, why):
               .replace("{shot_note}", " and a SCREENSHOT of it at orca/checkpoint.png (open it with your Read tool and look at it)" if has_shot else "")
               .replace("{max_add}", str(P.cfg.get("checkpoint_max_add", 5)))
               .replace("{max_remove}", str(P.cfg.get("checkpoint_max_remove", 5)))
+              .replace("{brief}", clip(P.rd("BRIEF.md"), 4000))
               .replace("{spec}", clip(P.rd("SPEC.md"), 4000))
+              .replace("{acceptance}", orca_accept.summary(P))
               .replace("{tasks}", "\n".join(rows))
               .replace("{progress}", clip(P.rd("PROGRESS.md"), 1500))
               .replace("{numbers}", numbers)
               .replace("{smoke}", smoke))
     out = ask_claude(P.cfg, prompt, purpose="checkpoint", cwd=str(P.root),
-                     extra_args=["--allowedTools", "Read"] if has_shot else [])
+                     extra_args=["--tools", "Read", "--allowedTools", "Read"] if has_shot else NO_TOOLS)
     if not out:
         log("   course check: no answer from Claude, carrying on")
         return
@@ -2554,6 +2646,10 @@ def cmd_run(a):
     if not P.cfg["test_cmd"]:
         sys.exit("orca.json has no test_cmd. Tests are the judge, set one.")
     claim_pidfile(P)              # before loading the model: from here on a second run or (r) sees this one
+    # A build started in the background (`&`, nohup) inherits SIGINT as ignored, so Ctrl-C from stop --now or (K) did
+    # nothing. Take both signals back: they end the build the clean way (KeyboardInterrupt), state saved.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, lambda n, f: (_ for _ in ()).throw(KeyboardInterrupt()))
     set_state(phase="starting: loading the model")
     ensure_model(P)
     probe_thinking(P)
@@ -2723,12 +2819,9 @@ def cmd_tui(a):
 def cmd_stop(a):
     P = Project(a.dir)
     if a.now:
-        try:
-            pid = int(P.rd("run.pid").strip())
-            os.kill(pid, signal.SIGINT)
-            print("sent Ctrl-C to run (pid %d). Finished tasks are committed, rerun to resume." % pid)
-        except (ValueError, OSError):
-            print("no running build found")
+        # kill_run: Ctrl-C, then SIGKILL if the build ignores it (a build started with `&` or nohup inherits SIGINT as
+        # "ignored"; the benchmarks' background builds never stopped on --now)
+        print(kill_run(P))
         return
     P.o.mkdir(exist_ok=True)
     (P.o / "STOP").write_text("stop")

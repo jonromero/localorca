@@ -26,10 +26,14 @@ import time
 from pathlib import Path
 
 import orca
+import orca_accept
 
 NOTE_RE = re.compile(r"^- \[( |x|>)\] (N\d+): (.*)$")
 AGENT_TOOLS = ["Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"]
 CONFIG_KEYS = ("test_cmd", "setup_cmd", "preview_cmd", "preview_url", "smoke_cmd")
+# A small product does not repay course checks every few tasks (benchmark: a 215-line game cost $1.16 with LocalOrca and
+# $0.19 with Claude alone). Small ones get only the final course check.
+SMALL_CONFIG = {"checkpoint_every": 999, "checkpoint_minutes": 0}
 
 RESEARCH_PROMPT = """You are the architect for a build that happens in two parts. First YOU build a prototype: the real UI and a walking skeleton. Then a small local coding model (Qwen, 32k context, no memory between tasks, works from files only, tests are its only judge) builds the rest one small task at a time on top of your code.
 Now: RESEARCH, then the SPEC. Use WebSearch and WebFetch for what matters here: the simplest current stack and libraries (versions that exist today), how similar products solve the core problem, the UI patterns users expect, known pitfalls. Be practical, 5 to 10 searches. Do not write code.
@@ -43,7 +47,7 @@ Output EXACTLY these three sections and nothing else. Each starts with its marke
 =====SPEC.md=====
 (UNDER 70 lines. The builder reads ALL of it at the start of EVERY task with a tiny context, so every line must earn its place. Short `## Section` headings: Goal, Stack, ## Screens (every screen and its main controls, one line each), ## Files (the folder layout, one line per file, small files: source at most about 150 lines), ## Conventions (module pattern, naming, how tests are written, so the small model copies them), Data (shapes, at most 3 lines per example). No prose, no marketing, no rationale.)
 =====CONFIG=====
-(JSON only: {{"test_cmd": "...", "setup_cmd": "...", "preview_cmd": "...", "preview_url": "...", "smoke_cmd": "..."}}. test_cmd runs the whole suite fast and exits nonzero on failure, with no browser (LocalOrca runs its own headless real-app check). setup_cmd installs dependencies, or "". Screen apps (web, games): preview_cmd starts the real app, which listens on the PORT env variable, preview_url is a CONCRETE url with the port it uses when PORT is not set (for example http://localhost:8000), and smoke_cmd is left out. Everything else: smoke_cmd runs scripts/smoke.sh (the real product, real input, no mocks), preview_cmd and preview_url are left out.)
+(JSON only: {{"test_cmd": "...", "setup_cmd": "...", "preview_cmd": "...", "preview_url": "...", "smoke_cmd": "...", "size": "small|medium|large"}}. size: small = one screen or about 500 source lines or less (a small game, a one-page tool), large = many screens, accounts, roles or an API with 15+ routes, medium = between. test_cmd runs the whole suite fast and exits nonzero on failure, with no browser (LocalOrca runs its own headless real-app check). setup_cmd installs dependencies, or "". Screen apps (web, games): preview_cmd starts the real app, which listens on the PORT env variable, preview_url is a CONCRETE url with the port it uses when PORT is not set (for example http://localhost:8000), and smoke_cmd is left out. Everything else: smoke_cmd runs scripts/smoke.sh (the real product, real input, no mocks), preview_cmd and preview_url are left out.)
 """
 
 PROTOTYPE_PROMPT = """You are building the PROTOTYPE of this product in the current folder. Read orca/SPEC.md and orca/RESEARCH.md first (orca/BRIEF.md has the owner's words).
@@ -52,6 +56,7 @@ A small local model (Qwen, 32k context, no memory between tasks) will build ever
 Build:
 1/ The REAL UI. Every screen in the spec exists, is reachable, and looks like the finished product: layout, styling, navigation, controls, empty states. Where the logic is not built yet, show realistic sample data and put a `TODO(qwen): <what to build here>` comment at that spot.
 2/ A walking skeleton. The app starts with preview_cmd ({preview_cmd}) and listens on the PORT env variable (non-screen products: scripts/smoke.sh runs the real product). ONE core user path works end to end with real code, no fakes.
+   ONLY that one path. Do NOT build the product's rules, features or the rest of its API: each becomes a `TODO(qwen)` mark where it belongs, Qwen builds it. A prototype that is already the whole product leaves Qwen nothing but extras, and costs more than building it outright. Aim for well under 1000 source lines.
 3/ Tests. `{test_cmd}` passes. Include pure logic tests, and for a web app a test that every file the page and its scripts load exists. Keep test_cmd FAST and headless-free: no browser tests, no Playwright or Puppeteer, do not install browsers. LocalOrca checks the real app in a browser itself: {smoke_note}
 4/ Qwen-friendly code. SMALL files: source at most about 150 lines, tests at most about 250. One file per function group, the folder layout from the spec, one consistent pattern everywhere, short comments only where they help. No dead code.
 
@@ -77,16 +82,34 @@ FIX_PROMPT = """The checks failed after your work. Fix the REAL code (change a t
 {fail}
 """
 
+ACCEPT_PROMPT = """Before the build is planned, write the ACCEPTANCE TESTS for this product, from the owner's brief (orca/BRIEF.md). Read it, orca/SPEC.md and the code first.
+A small local model (Qwen) builds the rest. Its own unit tests only check its own plan, and plans drift from the brief (real failures: a shuffled bag instead of one random draw per piece; most of a required JSON API never built; a rate limit per hour instead of per minute; arrow keys that did nothing while 126 unit tests passed). Your tests are the brief's judge. Qwen can read them but never change them.
+
+Write them in `{folder}/` (black-box, through the product's real public surface: its API, its exported game or logic module, its CLI, its pages; never private helpers):
+1/ ONE test per requirement in the brief: every rule, number, route, status code, state, key, limit and message it fixes. Exact values from the brief. Skip only pure looks (colors, style).
+2/ Every test's NAME starts with its id: A01, A02, ... (`def test_A07_left_moves_one_column` in pytest, `test("A07 left moves one column", ...)` in node). One id per test.
+3/ The files must NOT be picked up by `{test_cmd}` (most of them fail until Qwen builds the features). Name them so the runner's default discovery skips them: pytest `{folder}/acc_*.py` (not test_*.py), node `{folder}/*.acc.mjs` (not *.test.*). Add a conftest or helper there if needed.
+4/ A command that runs them all with per-test results in its output: pytest `python -m pytest -q -rA {folder}/acc_*.py`, node `node --test --test-reporter=tap {folder}/*.acc.mjs`.
+5/ Tests that need the app running start it themselves (a test client, an import, or a subprocess on a free port). No browsers.
+6/ Write orca/ACCEPTANCE.md: one line per id, `A07: Left moves the piece one column | brief: "Left and Right arrows move one column"` (the brief's own words). Every requirement of the brief must have a line.
+Run the command: the tests must RUN (failures are expected, crashes and import errors are not), and `{test_cmd}` must still pass. Do not change the product code. Do not commit.
+Reply with at most 5 lines: how many tests, which already pass. The LAST line must be exactly: `ACCEPTANCE_CMD: <the command>`
+"""
+
 BREAKDOWN_PROMPT = """The owner approved the prototype in this folder. Plan the REST of the build for a small local coding model (Qwen, 32k context, no memory between tasks). At the start of every task it reads orca/SPEC.md and a code map, nothing else. Tests are its only judge.
 You may Read, Glob and Grep the code. Do not edit anything.
 
 Output EXACTLY one marker line `=====TASKS.md=====` and then task lines only, each ONE line: `- [ ] T01: title | done when: a test shows ...`
 Rules:
-1/ 20 to 60 tasks. OPEN NOTES first: each becomes one task (or a few, if it is big), in note order, its title starting with the note id in brackets, for example `T01: [N02] bigger Add button`.
+1/ 8 to 40 tasks. OPEN NOTES first: each becomes one task (or a few, if it is big), in note order, its title starting with the note id in brackets, for example `T01: [N02] bigger Add button`.
 2/ Then the rest of the product, ordered so each task builds on the last, and every task adds one visible or usable thing to the RUNNING app (a vertical slice, never invisible plumbing). Replace the TODO(qwen) marks with real code.
-3/ Every task names the real files it changes (paths from the code) or the new small files it creates. SMALL: one function, or two or three tiny related ones, roughly 50 to 100 new lines, at most 3 behaviours in its done-when. A file stays under about 150 lines; a group that grows becomes a folder of small files.
+3/ Every task names the real files it changes (paths from the code) or the new small files it creates, after `| files:`, test files included. One task is one feature SLICE: its logic, the route, screen or hook that uses it, and its tests together (roughly 60 to 150 new lines, at most 3 behaviours in its done-when). Never split a slice into "service" and then "route for the service": every task costs a fixed amount of reading. A file stays under about 150 lines; a group that grows becomes a folder of small files.
 4/ "done when" is always checked automatically by the test command: write "done when: a test shows ...". Never "in the browser", "visually", "looks right" or "manually".
 5/ Do not plan the prototype again, it exists and works.
+6/ ACCEPTANCE. End every task line that makes acceptance tests pass with `| accept: A03 A07`: the ids it makes pass. Put an id on the LAST task it needs (the test must pass when that task is done). EVERY failing id below must be on exactly one task. Follow the BRIEF where the spec or the prototype differ from it: the brief wins.
+
+FAILING ACCEPTANCE TESTS (ids, what each checks; written from the brief, read-only for Qwen):
+{acceptance}
 
 OPEN NOTES FROM THE OWNER (not yet in the code):
 {notes}
@@ -314,7 +337,7 @@ def claude_agent(P, prompt, purpose, tools, timeout, resume=None):
     model = orca.claude_model_now(cfg)
     cmd = (list(cfg["claude_cmd"]) + (["--model", model] if model else []) + (["--resume", resume] if resume else [])
            + [x for d in (cfg.get("extra_dirs") or []) for x in ("--add-dir", str(d))]   # reference folders (orca.json extra_dirs)
-           + ["--allowedTools", ",".join(tools), "--permission-mode", "acceptEdits",
+           + ["--tools", ",".join(tools), "--allowedTools", ",".join(tools), "--permission-mode", "acceptEdits",
               "--output-format", "stream-json", "--verbose", prompt])
     run = {"acts": [], "text": "", "result": None, "sid": resume, "msg_usage": {}}
     t0 = time.time()
@@ -472,6 +495,10 @@ def research(P):
     cp = P.root / "orca.json"
     base = json.loads(cp.read_text()) if cp.exists() else {}
     base.update({k: v for k, v in conf.items() if k in CONFIG_KEYS})
+    if str(conf.get("size", "")).lower() == "small":
+        base.update(SMALL_CONFIG)
+        orca.log("SMALL PRODUCT: Claude alone would likely build this for less than LocalOrca's fixed design and check costs "
+                 "(about $1). LocalOrca carries on with course checks only at the end.")
     base["smoke_from"] = "T00"              # the prototype is the skeleton: the real-app check is on from Qwen's first task
     cp.write_text(json.dumps(base, indent=2) + "\n")
     P.cfg.update(base)
@@ -634,18 +661,29 @@ def cmd_handoff(a):
                  "Press (b) so Claude fixes it, then (h) again." % orca.clip(out, 600))
         orca.set_state(phase="design: prototype checks FAIL")
         sys.exit(1)
+    sid, acc_note = write_acceptance(P)
     ns = open_notes(P)
     orca.set_state(phase="hand-off: Claude breaks the rest into small tasks")
     orca.log("Claude breaks the rest into small tasks for Qwen (%d open notes become the first ones, 2 to 5 min)" % len(ns))
     cmap, _ = orca.code_map(P, cap=12000)
-    prompt = BREAKDOWN_PROMPT.format(notes=notes_block(ns), todos=todo_marks(P), codemap=cmap)
-    text, _ = claude_agent(P, prompt, "breakdown", ["Read", "Glob", "Grep"], P.cfg["claude_timeout"] * 2)
+    prompt = BREAKDOWN_PROMPT.format(notes=notes_block(ns), todos=todo_marks(P), codemap=cmap, acceptance=acc_note)
+    text, _ = claude_agent(P, prompt, "breakdown", ["Read", "Glob", "Grep"], P.cfg["claude_timeout"] * 2, resume=sid)
     tasks = parse_tasks(text or "")
     if len(tasks) < 3:
         P.wr("breakdown_raw.txt", text or "")
         orca.log("could not read a task list from Claude's reply (saved to %s/breakdown_raw.txt). Try (h) again." % P.o.name)
         orca.set_state(phase="design review: hand-off failed, try again")
         sys.exit(1)
+    if orca_accept.active(P):
+        st = orca_accept.state(P)
+        failing = [i for i, ok in sorted((st.get("last") or {}).items()) if not ok]
+        missing = orca_accept.uncovered(failing, tasks)
+        if missing:
+            nums = [int(re.match(r"^- \[ \] T(\d+)", t).group(1)) for t in tasks]
+            extra = orca_accept.cover_tasks(missing, orca_accept.names(P), max(nums + [0]) + 1)
+            tasks += extra
+            orca.log("the plan left %d failing acceptance test(s) without a task (%s): added %d task(s) for them"
+                     % (len(missing), " ".join(missing), len(extra)))
     head = "- [x] T00: prototype by Claude (real UI and walking skeleton, revision %d) | done when: the tests and the real-app check pass" % proto(P)["revision"]
     P.wr("TASKS.md", "\n".join([head] + tasks) + "\n")
     for name in ("LESSONS.md", "PROGRESS.md"):
@@ -667,6 +705,48 @@ def cmd_handoff(a):
     if a.go:
         (P.o / "run.pid").unlink()
         orca.cmd_run(type("A", (), {"dir": str(P.root), "force": False})())
+
+
+def write_acceptance(P):
+    """Claude writes the acceptance tests from the brief (once). Returns (Claude session id to plan in, text for the plan)."""
+    if P.cfg.get("acceptance") is False:
+        return None, "(acceptance tests are off for this project)"
+    if not P.cfg.get("acceptance_cmd"):
+        folder = P.cfg.get("acceptance_dir", "acceptance")
+        orca.set_state(phase="hand-off: Claude writes acceptance tests from the brief")
+        orca.log("Claude writes the acceptance tests from the brief (read-only for Qwen, 3 to 8 min)")
+        text, sid = claude_agent(P, ACCEPT_PROMPT.format(folder=folder, test_cmd=P.cfg["test_cmd"]), "acceptance",
+                                 ["Read", "Write", "Edit", "Bash", "Glob", "Grep"], P.cfg["design_timeout"])
+        m = re.search(r"^\s*`?ACCEPTANCE_CMD:\s*`?(.+?)`?\s*$", text or "", flags=re.M)
+        if not m:
+            orca.log("no ACCEPTANCE_CMD line in Claude's reply, the build goes on without acceptance tests")
+            return sid, "(no acceptance tests)"
+        cp = P.root / "orca.json"
+        conf = json.loads(cp.read_text())
+        conf["acceptance_cmd"] = m.group(1).strip()
+        cp.write_text(json.dumps(conf, indent=2) + "\n")
+        P.cfg.update(conf)
+        ok, out = check(P)
+        if not ok:          # the acceptance files were picked up by test_cmd (or broke it): one fix round, same session
+            orca.log("test_cmd fails after the acceptance tests were added, Claude fixes that:\n" + orca.clip(out, 400))
+            _, sid = claude_agent(P, FIX_PROMPT.format(test_cmd=P.cfg["test_cmd"], fail=out) +
+                                  "\nThe acceptance tests in %s/ must not run under test_cmd. Do not delete them." % folder,
+                                  "acceptance-fix", ["Read", "Write", "Edit", "Bash", "Glob", "Grep"], P.cfg["design_timeout"], resume=sid)
+            ok, out = check(P)
+            if not ok:
+                sys.exit("HAND-OFF STOPPED: test_cmd fails with the acceptance tests in place:\n" + orca.clip(out, 600))
+    else:
+        sid = None
+    res, out = orca_accept.baseline(P)
+    if not res:
+        orca.log("could not read per-test results from `%s`, so acceptance only guards against regressions as a whole"
+                 % P.cfg["acceptance_cmd"])
+    else:
+        orca.log("ACCEPTANCE: %d tests from the brief, %d pass already" % (len(res), sum(res.values())))
+    P.commit("orca: acceptance tests from the brief")
+    nm = orca_accept.names(P)
+    failing = [i for i, ok in sorted(res.items()) if not ok]
+    return sid, "\n".join("%s: %s" % (i, nm.get(i, "")) for i in failing) or "(none failing)"
 
 
 def cmd_note(a):

@@ -8,7 +8,7 @@
   "test_cmd": "pytest -q",
   "setup_cmd": "",
   "max_attempts": 5,
-  "checkpoint_every": 8,
+  "checkpoint_every": 10,
   "min_free_pct": 15,
   "max_swap_mb": 3000,
   "reload_every": 0

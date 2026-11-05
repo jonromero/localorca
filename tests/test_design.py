@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import orca  # noqa: E402
+import orca_accept  # noqa: E402
 import orca_design  # noqa: E402
 
 FAKE = r'''#!%(py)s
@@ -23,6 +24,7 @@ with open(os.environ["FAKE_LOG"], "a") as f:
 def emit(o):
     print(json.dumps(o), flush=True)
 def write(rel, text):
+    (cwd / rel).parent.mkdir(parents=True, exist_ok=True)
     (cwd / rel).write_text(text)
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {"file_path": str(cwd / rel), "content": text}}]}})
 emit({"type": "system", "subtype": "init", "session_id": "S1"})
@@ -30,12 +32,22 @@ TEST = "import unittest, app\nclass T(unittest.TestCase):\n    def test_greet(se
 if "RESEARCH, then the SPEC" in prompt:
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "WebSearch", "input": {"query": "phonics apps"}}]}})
     res = ("=====RESEARCH.md=====\n- kids like big buttons (https://example.com)\n=====SPEC.md=====\n# Spec\n## Stack\npython stdlib\n"
-           "=====CONFIG=====\n" + json.dumps({"test_cmd": os.environ["FAKE_TESTCMD"], "setup_cmd": "", "preview_cmd": "x"}))
+           "=====CONFIG=====\n" + json.dumps({"test_cmd": os.environ["FAKE_TESTCMD"], "setup_cmd": "", "preview_cmd": "x",
+                                              "size": os.environ.get("FAKE_SIZE", "medium")}))
 elif "building the PROTOTYPE" in prompt:
     write("app.py", "def greet():\n    return 'hi'  # TODO(qwen): real greeting\n")
     write("test_app.py", TEST %% ("WRONG" if os.environ.get("FAKE_BREAK") else "hi"))
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "The page shows a greeting."}]}})
     res = "You will see a greeting. Sample data only."
+elif "write the ACCEPTANCE TESTS" in prompt:
+    if os.environ.get("FAKE_ACCEPT"):
+        write("acceptance/acc_app.py", "import unittest, app\nclass T(unittest.TestCase):\n"
+              "    def test_A01_greets(self): self.assertEqual(app.greet(), 'hi')\n"
+              "    def test_A02_greets_by_name(self): self.assertEqual(app.greet('Ada'), 'hi Ada')\n")
+        write("orca/ACCEPTANCE.md", "A01: greet says hi | brief: says hi\nA02: greet uses the name | brief: by name\n")
+        res = "2 tests, A01 passes.\nACCEPTANCE_CMD: %%s -m unittest -v acceptance/acc_app.py" %% sys.executable
+    else:
+        res = "?"
 elif "The checks failed" in prompt:
     write("test_app.py", TEST %% "hi")
     res = "fixed the test"
@@ -152,6 +164,39 @@ class TestDesignStage(unittest.TestCase):
             self.assertIn("prototype revision 2", log)
             breakdown = [c for c in d.calls() if "Plan the REST" in c["prompt"]][0]
             self.assertNotIn("Write", ",".join(breakdown["args"]))             # planning cannot edit code
+        finally:
+            d.close()
+
+    def test_handoff_writes_acceptance_tests_and_covers_every_failing_one(self):
+        """Hearth: the plan left most of the brief's API out. Acceptance tests from the brief + a coverage check."""
+        d = DesignProject()
+        d.env["FAKE_ACCEPT"] = "1"
+        try:
+            self.assertEqual(d.orca("design", str(d.dir))[0], 0)
+            rc, out = d.orca("handoff", str(d.dir))
+            self.assertEqual(rc, 0, out)
+            P = d.P()
+            self.assertIn("acceptance/acc_app.py", P.cfg["acceptance_cmd"])
+            self.assertEqual(orca_accept.state(P)["passing"], ["A01"])
+            self.assertIn("ACCEPTANCE: 2 tests from the brief, 1 pass already", out)
+            covering = [t for t in P.tasks() if "A02" in orca_accept.task_ids(t["text"])]
+            self.assertEqual(len(covering), 1, [t["text"] for t in P.tasks()])
+            breakdown = [c for c in d.calls() if "Plan the REST" in c["prompt"]][0]
+            self.assertIn("S1", breakdown["args"])                         # planned in the session that wrote the tests
+            acc_call = [c for c in d.calls() if "write the ACCEPTANCE TESTS" in c["prompt"]][0]
+            self.assertIn("--tools", acc_call["args"])
+        finally:
+            d.close()
+
+    def test_a_small_product_gets_only_the_final_course_check(self):
+        d = DesignProject()
+        d.env["FAKE_SIZE"] = "small"
+        try:
+            rc, out = d.orca("design", str(d.dir))
+            self.assertEqual(rc, 0, out)
+            self.assertIn("SMALL PRODUCT", out)
+            self.assertEqual(d.P().cfg["checkpoint_every"], 999)
+            self.assertEqual(d.P().cfg["checkpoint_minutes"], 0)
         finally:
             d.close()
 
