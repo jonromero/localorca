@@ -245,14 +245,40 @@ def usage_of(result, msg_usage=None):
     return tot
 
 
-def log_usage(P, purpose, tot, result, secs):
+TOKEN_KEYS = ("input", "output", "cache_read", "cache_create", "cost_usd")
+
+
+def session_delta(P, sid, tot):
+    """A resumed Claude session reports the totals of the WHOLE session, not of this call (real: a 6.6 s "prototype-fix"
+    logged 43k output tokens and $0.77, the prototype's own totals plus $0.04). Subtract what the session had already
+    reported, kept as "cum" on its last row in design_usage.jsonl. Returns (this call's tokens, the new session totals)."""
+    cum = dict((k, tot[k]) for k in TOKEN_KEYS)
+    prev = None
+    for l in P.rd("design_usage.jsonl").splitlines():
+        try:
+            r = json.loads(l)
+        except ValueError:
+            continue
+        if sid and r.get("sid") == sid and isinstance(r.get("cum"), dict):
+            prev = r["cum"]
+    if not prev or any((tot[k] or 0) < (prev.get(k) or 0) for k in TOKEN_KEYS):
+        return tot, cum                      # a new session, or totals that are not cumulative after all
+    out = dict(tot)
+    for k in TOKEN_KEYS:
+        out[k] = (tot[k] or 0) - (prev.get(k) or 0)
+    out["cost_usd"] = round(out["cost_usd"], 6)
+    return out, cum
+
+
+def log_usage(P, purpose, tot, result, secs, sid=None, cum=None):
     """One line in the Messages panel and one JSON line in orca/design_usage.jsonl (kept in git, for comparing builds)."""
     billed = tot["input"] + tot["output"] + tot["cache_create"]
     orca.log("CLAUDE TOKENS %s: %s in, %s out, %s cache write, %s cache read (%s counted), %d turns, %s%s" % (
         purpose, "{:,}".format(tot["input"]), "{:,}".format(tot["output"]), "{:,}".format(tot["cache_create"]),
         "{:,}".format(tot["cache_read"]), "{:,}".format(billed), (result or {}).get("num_turns") or 0, orca.fmt_dur(secs),
         ", " + ", ".join(tot["models"]) if tot["models"] else ""))
-    row = dict(tot, t=time.time(), purpose=purpose, counted=billed, turns=(result or {}).get("num_turns"), secs=round(secs, 1))
+    row = dict(tot, t=time.time(), purpose=purpose, counted=billed, turns=(result or {}).get("num_turns"), secs=round(secs, 1),
+               sid=sid, cum=cum)
     try:
         P.o.mkdir(exist_ok=True)
         with open(str(P.o / "design_usage.jsonl"), "a") as f:
@@ -365,10 +391,11 @@ def claude_agent(P, prompt, purpose, tools, timeout, resume=None):
         p.wait()
     r = run["result"]
     tot = usage_of(r, run["msg_usage"])
+    tot, cum = session_delta(P, run["sid"], tot) if resume else (tot, dict((k, tot[k]) for k in TOKEN_KEYS))
     if r or run["msg_usage"]:
         orca.record("claude", purpose if r else purpose + "-unfinished", input=tot["input"], output=tot["output"],
                     cache_read=tot["cache_read"], cache_create=tot["cache_create"], cost_usd=tot["cost_usd"])
-        log_usage(P, purpose if r else purpose + "-unfinished", tot, r, time.time() - t0)
+        log_usage(P, purpose if r else purpose + "-unfinished", tot, r, time.time() - t0, sid=run["sid"], cum=cum)
     if not r:
         orca.log("claude ended without a result (rc=%s)%s: %s" % (p.returncode, " TIMEOUT" if p.returncode in (-9, 137) else "",
                                                                   "".join(other)[-300:].strip()))

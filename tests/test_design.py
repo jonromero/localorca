@@ -188,6 +188,20 @@ class TestDesignStage(unittest.TestCase):
         finally:
             d.close()
 
+    def test_a_resumed_session_counts_only_its_own_tokens(self):
+        """Claude reports a resumed session's running totals: a 6.6 s fix logged the prototype's $0.73 again."""
+        d = DesignProject(broken=True)
+        try:
+            d.orca("design", str(d.dir))
+            rows = [json.loads(l) for l in (d.dir / "orca" / "design_usage.jsonl").read_text().splitlines()]
+            fix = [r for r in rows if r["purpose"] == "prototype-fix"]
+            self.assertTrue(fix, rows)
+            self.assertEqual(fix[0]["cost_usd"], 0)            # the fake reports the same session totals again
+            self.assertEqual(fix[0]["output"], 0)
+            self.assertAlmostEqual(orca_design.design_totals(d.P())["cost_usd"], 0.51 * (len(rows) - len(fix)), places=4)
+        finally:
+            d.close()
+
     def test_a_small_product_gets_only_the_final_course_check(self):
         d = DesignProject()
         d.env["FAKE_SIZE"] = "small"
